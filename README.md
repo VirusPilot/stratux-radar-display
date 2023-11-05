@@ -6,6 +6,7 @@ Implementation of a standalone Radar display for Stratux Europe Edition. Can run
 - update in version 1.6: an additional epaper display is now supported (1.54 epaper Waveshare module 12955 or 12561+hat). This is a good option for the oled display. Perfect visibility in sunlight, but slower than the oled. Can be used in 2 1/4 instrument holes.
 - update in version 1.7: optional CO sensor is supported (see wiki)
 - update in version 1.8: integration of distance sensor and calculation of start/landing distances
+- update in version 1.9: adding mode selection parameter and start/landing distance calculation with ultrasonic sensor
 
 Current supported displays are:
 - Oled Display 1.5 inch (waveshare)
@@ -124,8 +125,8 @@ All pushbuttons are used as pull down. Connect the other side of all buttons to 
 
 The Oled display uses different GPIO-Pins as the baro-sensor, so there is no conflict. Also the e-Paper display can be connected (not the HAT version) with the baro and ahrs sensors in place.
 - Remark: Bluetooth is currently not properly supported by Stratux, so if you want audio output to your headset, please use an additional Raspberry Zero 2 W or Zero W for the display.
-- Remark: The ogn receiver is conflicting with connection lines of the Epaper-display. So if you want to use Epaper and an 868-OGN-receiver, currently you need to install the display on an Pi Zero (or Zero 2) (working to solve this ...)
-
+- Remark: The ogn receiver is potentially conflicting with connection lines of the Epaper-display. Starting with Stratux 
+Version EU28 there is a setting availabe to resolve the conflict: Go to Stratux settings and disable "OGN Transmission via I²C/GPIO HAT".
    
 ### External Sound output
    
@@ -230,7 +231,8 @@ Recommended setting for normal piston aircraft is 5 nm and 2000 ft.
 # Shell command parameters
 ```
 usage: radar.py [-h] -d DEVICE [-b] [-sd] [-n] [-t] [-a] [-x] [-g] [-o] [-i] [-z] [-w] [-sit] [-c CONNECT]
-                [-v VERBOSE] [-r] [-e] [-y EXTSOUND] [-nf] [-nc] [-ci] [-gd] [-gb] [-mx MIXER]
+                [-v VERBOSE] [-r] [-e] [-y EXTSOUND] [-nf] [-nc] [-ci] [-gd] [-gb] [-sim] [-mx MIXER]
+                [-modes DISPLAYMODES]
 
 Stratux radar display
 
@@ -264,7 +266,13 @@ optional arguments:
   -gd, --grounddistance
                         Activate ground distance sensor
   -gb, --groundbeep     Indicate ground distance via sound
+  -sim, --simulation    Simulation mode for testing
   -mx MIXER, --mixer MIXER
                         Mixer name to be used for sound output
+  -modes DISPLAYMODES, --displaymodes DISPLAYMODES
+                        Select display modes that you want to see R=radar T=timer A=ahrs D=display-status G=g-meter
+                        K=compass V=vsi I=flighttime S=stratux-status C=co-sensor M=distance measurement Example:
+                        -modes RADCM
+```
 
 
