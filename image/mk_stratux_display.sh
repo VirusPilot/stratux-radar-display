@@ -5,36 +5,70 @@
 # sudo apt install --yes parted zip unzip zerofree
 # If you want to build on x86 with aarch64 emulation, additionally install qemu-user-static qemu-system-arm
 # Run this script as root.
-# Run with argument "dev" to get the dev branch from github, otherwise with main
-# Run with optional argument "v64" to create 64 bit based images for zero2
+#  sudo /bin/bash mk_stratux_display.sh [-b <branch>] [-k v32] [-u <USB-stick-name>]
+# Run with argument "-b dev" to get the dev branch from github, otherwise with main
+# Run with optional argument "-k v32" to create 32 bit based images for zero 1
+# Run with optional argument "-u <USB-stick-name>" to move created images on the usb stick and then umount this
+# Run with optional argument "-w" to use bookworm images (either 32 bit or 64 bis)
 # call examples:
-#   sudo /bin/bash mk_stratux_display.sh "Create failed" dev
-#   sudo /bin/bash mk_stratux_display.sh "Create failed" main
-# sudo /bin/bash mk_stratux_display.sh "Create failed" main v64
+#   sudo /bin/bash mk_stratux_display.sh
+#   sudo /bin/bash mk_stratux_display.sh -b dev
+#   sudo /bin/bash mk_stratux_display.sh -b dev -k v32
 
-set -x
+# set -x
+
 TMPDIR="/home/pi/image-tmp"
 DISPLAY_SRC="home/pi"
-
 
 die() {
     echo "$1"
     exit 1
 }
 
-if [ "$#" -lt 2 ]; then
-    echo "Usage: " "$0" "  <fail output> dev|main [v64]"
-    exit 1
-fi
-IMAGE_VERSION="armhf"
-outprefix="stratux-display"
-if [ "$#" -gt 2 ] &&  [ "$3" == "v64" ]; then
-    IMAGE_VERSION="arm64"
-    outprefix="stratux-display64"
+# set defaults
+BRANCH=main
+V32=false
+USB_NAME=""
+
+# check parameters
+while getopts ":b:k:u" opt; do
+  case $opt in
+    b)
+      BRANCH="$OPTARG"
+      ;;
+    k)
+      if [ "$OPTARG" = "v32" ]; then
+        V32=true
+      fi
+      ;;
+    u)
+      USB_NAME=$OPTARG
+      ;;
+    \?)
+      echo "Invalid option: -$OPTARG"
+      exit 1
+      ;;
+    :)
+      echo "option -$OPTARG requires a value."
+      exit 1
+      ;;
+  esac
+done
+
+echo "Building images for branch '$BRANCH' V32=$V32 based on Bookworm"
+
+if [ "$V32" = true ]; then
+  IMAGE_VERSION="armhf"
+  outprefix="v32-stratux-display"
+else
+  IMAGE_VERSION="arm64"
+  outprefix="stratux-display"
 fi
 
-BASE_IMAGE_URL="https://downloads.raspberrypi.org/raspios_$IMAGE_VERSION/images/raspios_$IMAGE_VERSION-2023-05-03/2023-05-03-raspios-bullseye-$IMAGE_VERSION.img.xz"
-ZIPNAME="2023-05-03-raspios-bullseye-$IMAGE_VERSION.img.xz"
+ZIPNAME="2024-07-04-raspios-bookworm-${IMAGE_VERSION}-lite.img.xz"
+BASE_IMAGE_URL="https://downloads.raspberrypi.org/raspios_lite_${IMAGE_VERSION}/images/raspios_lite_${IMAGE_VERSION}-2024-07-04/${ZIPNAME}"
+
+
 IMGNAME="${ZIPNAME%.*}"
 
 # cd to script directory
@@ -59,11 +93,11 @@ bootoffset=$(( 512*bootoffset ))
 
 # Original image partition is too small to hold our stuff.. resize it to 5120 Mb
 # Append one GB and truncate to size
-truncate -s 5120M $IMGNAME || die "Image resize failed"
+truncate -s 4000M $IMGNAME || die "Image resize failed"
 lo=$(losetup -f)
 losetup "$lo" $IMGNAME
 partprobe "$lo"
-e2fsck -f "${lo}"p2
+e2fsck -y -f "${lo}"p2
 parted "${lo}" resizepart 2 100%
 partprobe "$lo" || die "Partprobe failed failed"
 resize2fs -p "${lo}"p2 || die "FS resize failed"
@@ -73,26 +107,34 @@ mkdir -p mnt
 mount -t ext4 "${lo}"p2 mnt/ || die "root-mount failed"
 mount -t vfat "${lo}"p1 mnt/boot || die "boot-mount failed"
 
-cd mnt/$DISPLAY_SRC || die "cd failed"
-sudo -u pi git clone --recursive -b "$2" https://github.com/TomBric/stratux-radar-display.git
-cd ../../../
-chroot mnt /bin/bash $DISPLAY_SRC/stratux-radar-display/image/mk_configure_radar.sh "$2"
-mkdir -p out
 
-# copy wpa_config and create empty ssh
-cp mnt/$DISPLAY_SRC/stratux-radar-display/image/wpa_supplicant.conf mnt/boot
-touch mnt/boot/ssh
-
-# configuration to use uart for ultrasonic ground sensor
-{
-  echo "# modification for ultrasonic ground sensor"
-  echo "enable_uart=1"
-  echo "dtoverlay=miniuart-bt"
-} >> mnt/boot/config.txt
-# disable ssh over serial otherwise UART is not working properly, change entries in cmdline if console is enabled there
+# for groundsensor, disable ssh over serial cause it is needed for the sensor
+# disable ssh over serial otherwise
+# does not work in mk_configure_radar, since it is not mounted there when called via chroot mnt
+# before first boot cmdline and config are still in /boot not /boot/firmware
 sed -i mnt/boot/cmdline.txt -e "s/console=ttyAMA0,[0-9]\+ //"
 sed -i mnt/boot/cmdline.txt -e "s/console=serial0,[0-9]\+ //"
+sed -i mnt/boot/cmdline.txt -e "s/console=tty[0-9]\+ //"
 
+# modify /boot/config.text for groundsensor
+{
+  echo "# modification for UART ground sensor"
+  echo "enable_uart=1"
+  echo "dtoverlay=miniuart-bt"
+} | tee -a mnt/boot/config.txt
+
+
+# install git for cloning repo (if not already installed) and pip
+chroot mnt apt install git -y
+
+cd mnt/$DISPLAY_SRC || die "cd failed"
+su pi -c "git clone --recursive -b $BRANCH https://github.com/TomBric/stratux-radar-display.git"
+
+cd ../../../
+# run the configuration skript, that is also executed when setting up on target device
+unshare -mpfu chroot mnt /bin/bash "$DISPLAY_SRC"/stratux-radar-display/image/mk_configure_radar.sh "$BRANCH"
+
+# mkdir -p out
 umount mnt/boot
 umount mnt
 
@@ -142,6 +184,12 @@ sed -i 's/TEMP_EP/Epaper_1in54/g' mnt/$DISPLAY_SRC/stratux-radar-display/image/s
 umount mnt
 mv ${outprefix}-epaper_3in7"${outname}" ${outprefix}-epaper_1in54"${outname}"
 zip out/${outprefix}-epaper_1in54"${outname}".zip ${outprefix}-epaper_1in54"${outname}"
+# remove last unzipped image
+rm ${outprefix}-epaper_1in54"${outname}"
 
-echo "Final images have been placed into $TMPDIR/out. Please install and test the images."
-echo "For mounting USB stick: sudo mount -t exfat /dev/sda1 /media/usb"
+if [ "${#USB_NAME}" -eq 0 ]; then
+  echo "Final images have been placed into $TMPDIR/out. Please install and test the images."
+else
+  mv $TMPDIR/out/${outprefix}* /media/pi/"$USB_NAME"; umount /media/pi/"$USB_NAME"
+  echo "Final images have been moved to usb stick $USB_NAME and umounted. Please install and test the images."
+fi

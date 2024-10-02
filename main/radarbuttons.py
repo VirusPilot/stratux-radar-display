@@ -32,96 +32,86 @@
 # OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
 import logging
-import time
-import RPi.GPIO as GPIO
+from gpiozero import Button
+from gpiozero.exc import GPIOZeroError, GPIODeviceError
+
+btn = None   # will be set in init
+gear_down_btn = None   # will be set ini int
 
 # global constants
-HOLD_TIME = 1.0  # time to trigger the hold activity if one button is pressed longer
+HOLD_TIME = 0.8 # time to trigger the hold activity if one button is pressed longer
+GEAR_HOLD_TIME = 0.3   # time until gear is indicated to be down
+BOUNCE_TIME = 0.05
 LEFT = 26
 MIDDLE = 20
 RIGHT = 21
+GEAR_DOWN = 19
 
-# status
-rlog = None
-time_left = 0.0
-time_middle = 0.0
-time_right = 0.0
-status_left = False
-status_middle = False
-status_right = False
+class RadarButton:
+    def __init__(self,gpio_number):
+        self.btn = Button(gpio_number, bounce_time=BOUNCE_TIME, hold_time=HOLD_TIME)
+        self.short = False
+        self.long = False
+        self.already_triggered = False
+        self.btn.when_released = self.released
+        self.btn.when_held = self.held
 
-io_status = {LEFT: {'virtualno': 0, 'status': False, 'starttime': 0.0, 'already_triggered': False},
-             MIDDLE: {'virtualno': 1, 'status': False, 'starttime': 0.0, 'already_triggered': False},
-             RIGHT: {'virtualno': 2, 'status': False, 'starttime': 0.0, 'already_triggered': False}}
+    def released(self):
+        if not self.already_triggered:
+            self.short = True
+        else:
+            self.already_triggered = False
+
+    def held(self):
+        self.long = True
+        self.already_triggered = True
+
+    def check_button(self):
+        if self.long:
+            self.long = False
+            return 2
+        if self.short:
+            self.short = False
+            return 1
+        return 0
 
 
 def init():
-    global io_status
     global rlog
-
-    GPIO.setmode(GPIO.BCM)
-    GPIO.setwarnings(False)
-
-    for iopin in io_status:
-        GPIO.setup(iopin, GPIO.IN, pull_up_down=GPIO.PUD_UP)
-        GPIO.add_event_detect(iopin, GPIO.FALLING, bouncetime=300)
+    global btn
 
     rlog = logging.getLogger('stratux-radar-log')
+    try:
+        btn = [RadarButton(LEFT), RadarButton(MIDDLE), RadarButton(RIGHT)]
+    except:
+        rlog.debug("ERROR: GPIO-Pins busy! No input possible. Please clarify!")
+        return False  # indicate errors
     rlog.debug("Radarbuttons: Initialized.")
+    return True    # indicate everything is fine
 
-
-def reset_buttons():   # called if timer was modified. Reset of all timestamps necessary
-    global io_status
-
-    for button in io_status:
-        io_status[button]['starttime'] = 0.0
-
-
-def check_one_button(button):
-    global io_status
-
-    if GPIO.event_detected(button):   # triggers on pull down
-        if GPIO.input(button) != GPIO.LOW:  # not pressed anymore
-            io_status[button]['status'] = False
-            if not io_status[button]['already_triggered']:
-                return 1  # short press
-            else:
-                io_status[button]['already_triggered'] = False
-                return 0  # unfortunately falling edge is triggered again if a long press is finished
-        else:   # event detected and still pressed
-            io_status[button]['starttime'] = time.time()
-            io_status[button]['status'] = True
-            return 0
-    if GPIO.input(button) == GPIO.LOW:
-        # pressed, but was already pressed, since no event was detected
-        if time.time() - io_status[button]['starttime'] >= HOLD_TIME:  # pressed for a long time
-            if not io_status[button]['already_triggered']:  # long hold was not triggered yet
-                io_status[button]['already_triggered'] = True
-                io_status[button]['status'] = False
-                return 2  # long
-            else:  # long press but already triggered
-                return 0
-        else:
-            return 0  # press time shorter, but not yet released, nothing to do
-    else:  # no more pressed
-        io_status[button]['already_triggered'] = False
-        if io_status[button]['status']:    # but was pressed before and did not trigger long press
-            io_status[button]['status'] = False
-            return 1  # short press
-    return 0   # no event, nothing pressed anymore
 
 
 def check_buttons():  # returns 0=nothing 1=short press 2=long press and returns Button (0,1,2)
-    global io_status
-
-    for button in io_status:
-        stat = check_one_button(button)
+    for index, but in enumerate(btn):
+        stat = but.check_button()
         if stat > 0:
-            rlog.debug("Button press: button " + str(io_status[button]['virtualno']) + " presstime " +
-                       str(stat) + " (1=short, 2=long)")
-            return stat, io_status[button]['virtualno']
+            rlog.debug("Button press: button {0} presstime {1} (1=short, 2=long)".format(index, stat))
+            return stat, index
     return 0, 0
 
 
-def cleanup():    # shutdown
-    GPIO.cleanup()
+def gear_is_down():
+    return gear_down_btn.is_held
+
+def init_gear_indicator(global_config, gear_down_indication):
+    global gear_down_btn
+
+    global_config['gear_indication_active'] = False
+    if gear_down_indication:
+        try:
+            gear_down_btn = Button(GEAR_DOWN, bounce_time=BOUNCE_TIME, hold_time=GEAR_HOLD_TIME)
+        except:
+            rlog.debug("Radarbuttons ERROR: GPIO-Pin {0} for gear down indication busy! Please clarify!".format(GEAR_DOWN))
+        else:
+            global_config['gear_indication_active'] = True
+            rlog.debug("Radarbuttons: Gear down indicator on GPIO{0} initialized.".format(GEAR_DOWN))

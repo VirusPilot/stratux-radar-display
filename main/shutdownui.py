@@ -32,6 +32,7 @@
 # OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
 import os
+import subprocess
 import radarbuttons
 import time
 import requests
@@ -59,16 +60,36 @@ def init(shutdown, reboot):
     rlog.debug("ShutdownUI: Initialized settings to: reboot url " + url_reboot + " shutdown url " + url_shutdown)
 
 
-def draw_shutdown(draw, display_control):
+
+def clear_lingering_radar():     # remove other radar.py processes, necessary sind lingering is enabled for bluetooth
+    current_pid = os.getpid()   # my processid
+    pid_list = []
+    pname = "radar.py"
+    try:
+        output = subprocess.check_output(['pgrep', '-f', pname]).decode('utf-8').strip()
+        pid_list = output.split('\n')   # generate a list of strings
+    except subprocess.CalledProcessError:
+        pass
+    for proc in pid_list:
+        if int(proc) != current_pid:
+            try:
+                print("Terminating other process {0}".format(int(proc)))
+                os.kill(int(proc), 9)   # Kill signal
+                time.sleep(2)   # give him some time to terminate
+            except OSError :
+                pass
+
+
+def draw_shutdown(display_control):
     global clear_before_shutoff
     global shutdown_mode
 
     if shutdown_time > 0:
-        display_control.clear(draw)
+        display_control.clear()
         rest_time = int(shutdown_time - time.time())
         if rest_time < 0:
             rest_time = 0   # if clear is too slow, so that not a minus is displayed
-        display_control.shutdown(draw, rest_time, shutdown_mode)
+        display_control.shutdown(rest_time, shutdown_mode)
         display_control.display()
     if clear_before_shutoff:   # this is signal for display driver to initiate shutdown/reboot
         display_control.cleanup()

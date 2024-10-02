@@ -49,15 +49,14 @@ def init(url):
     global url_settings_set
     global rlog
 
-    radarbuttons.init()
+    if not radarbuttons.init():   # error occured, e.g. gpio pins are buse
+        return False
     url_settings_set = url
     rlog = logging.getLogger('stratux-radar-log')
     rlog.debug("Radar UI: Initialized POST settings to " + url_settings_set)
-
+    return True
 
 def communicate_limits(radarrange, threshold):
-    global url_settings_set
-
     rlog.debug("COMMUNICATE LIMITS: Radius " + str(radarrange) + " Height " + str(threshold))
     try:
         requests.post(url_settings_set, json={'RadarLimits': threshold, 'RadarRange': radarrange})

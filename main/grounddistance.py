@@ -3,7 +3,7 @@
 # PYTHON_ARGCOMPLETE_OK
 #
 # BSD 3-Clause License
-# Copyright (c) 2022, Thomas Breitbach
+# Copyright (c) 2022-2024, Thomas Breitbach
 # All rights reserved.
 #
 # Redistribution and use in source and binary forms, with or without
@@ -35,6 +35,24 @@
 # enable_uart=1
 # dtoverlay=miniuart-bt
 
+# start and landing statistics are stored in stratux-radar.stat
+# This file has json coded statistics for every flight, see this example
+# {
+#    "start_time": "2023-01-15 12:57:21.873912+00:00",
+#    "start_altitude": 879.8726,
+#    "takeoff_distance": 0.0,
+#    "landing_time": "2023-01-15 12:57:22.106499+00:00",
+#    "landing_altitude": 879.8606,
+#    "landing_distance": 0.0
+# }{
+#    "start_time": "2023-01-15 12:57:28.223856+00:00",
+#    "start_altitude": 880.92865,
+#    "takeoff_distance": 0.0,
+#    "landing_time": "2023-01-15 12:57:28.444494+00:00",
+#    "landing_altitude": 880.77216,
+#    "landing_distance": 0.0
+# }
+
 import logging
 import radarmodes
 import time
@@ -44,32 +62,34 @@ import json
 import math
 import serial
 import simulation
+import radarbluez
+import radarbuttons
+import binascii
 
 rlog = None  # radar specific logger
 
 # constants
-MEASUREMENTS_PER_SECOND = 5    # number of distance ranging meaurements per second
+MEASUREMENTS_PER_SECOND = 10     # number of distance ranging meaurements per second
 # A22 usonic sensor allows approx. 10 per second
-
-UART_WAIT_TIME = 0.01  # time in seconds to wait for enough uart characters
-UART_BREAK_TIME = 1.00  # time in seconds when waiting is stopped
-# statistic file
-SAVED_STATISTICS = "stratux-radar.stat"
-# BEEP VALUES
-DISTANCE_BEEP_MAX = 60  # in cm, where beeper starts with a low tone
-DISTANCE_BEEP_MIN = 10  # in cm, where beeper stops with a high tone
+# TFMini-Plus sensor allows 100 per second
 
 # GPS-Measurement of start-distance
 DISTANCE_START_DETECTED = 30 * 10  # in mm where measurement assumes that plane is in the air
 DISTANCE_LANDING_DETECTED = 15 * 10  # in mm where measurement assumes to be landed
 OBSTACLE_HEIGHT = 50  # in feet, height value to calculate as obstacle clearance, 15 meters
-STOP_SPEED = 3  # in kts, speed when before runup or after landing a stop is assumed
+STOP_SPEED = 5  # in kts, speed when before runup or after landing a stop is assumed
 
 # start distance with groundsensor
 STATS_PER_SECOND = 5  # how many statistics are written per second
 STATS_FOR_SITUATION_CHANGE = 3  # no of values in a row before a situation is changed (landing/flying)
 STATS_TOTAL_TIME = 120  # time in seconds how long statistic window is
 INVALID_GDISTANCE = -9999   # indicates no valid grounddistance
+
+MIN_GPS_V_ACCURACY = 150   # minimum horizontal accuracy of gps, if not met, no speech warnings are spoken
+
+GEAR_DOWN_WARNING = '<pitch level="110"> Gear down! </pitch>'    # warning to be spoken, when gear_
+GEAR_NOT_DOWN_GO_AROUND = '<pitch level="130"> Go around! Gear not down! </pitch>'
+
 
 # globals
 ground_distance_active = False  # True if sensor is found and activated
@@ -83,12 +103,13 @@ statistics = []  # values for calculating everything
 stats_max_values = STATS_PER_SECOND * STATS_TOTAL_TIME
 stats_next_store = 0
 global_situation = None
+global_config = None
 fly_status = 0  # status for evaluating statistics 0 = run up  1 = start_detected 2 = 15 m detected
 # 3 = landing detected  4 = stop detected
 runup_situation = None  # situation values, for accelleration on runway started
 start_situation = None  # situation values when wheels leave the ground
 obstacle_up_clear = None  # situation values when obstacle clearance was reached when taking off
-obstacle_down_clear = None  # situation values when obstacle clearance was last reached when landing
+obstacle_down_clear = None  # situation values when obstacle clearance was last reacheds when landing
 landing_situation = None  # situation when wheels touch the ground
 stop_situation = None  # siuation values when the aircraft is stopped on the runway
 
@@ -96,12 +117,51 @@ stats_before_airborne = 0
 stats_before_landing = 0
 stats_before_stop = 0
 stats_before_obstacle_clear = 0
+saved_statistics = None    # filename for statistics, set in init
+
+gps_warnings = (1000, 500)    # speech warnings in feet, when calculated with gps
+gps_upper = [False] * len(gps_warnings)  # is true, if height + hysteresis was met
+sensor_warnings = (10, 5, 4, 3, 2, 1)   # speech warnings in feet, when calculated with groundsensor
+sensor_upper = [False] * len(sensor_warnings) # is true, if height + hysteresis was met
+
+gear_gps_warnings = (1000, 500, 400, 300, 200, 100)  # speech warnings if gear is not down, calculated with gps
+gear_gps_upper = [False] * len(gear_gps_warnings)  # is true, if height + hysteresis was met
+gear_sensor_warnings= (10, 5)   # speech warnings if gear is not down based on sensor
+gear_sensor_upper = [False] * len(gear_sensor_warnings)  # is true, if height + hysteresis was met
+
+hysteresis = 1.3    # hysteresis 10% for speech warnings,
+# this means a ground warning is only repeated if more than 10% more of height was reached in between
+
+INVALID_DEST_ELEVATION = 9999.0
+MIN_ELEVATION = -999.0
+dest_elevation = INVALID_DEST_ELEVATION
+# elevation for destination airport for height warnings, set to maximum if not set
+
+# sound variable for prepared pygame sounds
+gps_warnings_sounds = None
+sensor_warnings_sounds = None
+gear_not_down_warning_sound = None
+go_around_warning_sound = None
+
+
+def set_dest_elevation(dest_increment):
+    global dest_elevation
+    if dest_elevation == INVALID_DEST_ELEVATION:
+        if global_situation['gps_active']:
+            dest_elevation = math.ceil (global_situation['gps_altitude'] / 10) * 10   # round up to 10
+        else:
+            dest_elevation = dest_increment   # start with the first values, 100 or 10
+    else:
+        dest_elevation = dest_elevation + dest_increment
+        if dest_elevation >= INVALID_DEST_ELEVATION or dest_elevation <= MIN_ELEVATION:
+            # set to invalid if too high or too low
+            dest_elevation = INVALID_DEST_ELEVATION
+    rlog.debug('Grounddistance: Destination Altitude set to {0:5.0f}'.format(dest_elevation))
 
 
 class UsonicSensor:   # definition adapted from DFRobot code
     distance_max = 3000
     distance_min = 5
-    range_max = 3000
     ser = None
     distance = 0
 
@@ -160,6 +220,62 @@ class UsonicSensor:   # definition adapted from DFRobot code
                         self.distance = 0
 
 
+class LidarSensor:   # Implementation for TFMini-Plus Lidar Sensor
+    lidar_bytes = 9
+    distance_max = 5000    # sensor is able to detect till 12 meters but reliable only to 4 m in bad conditions
+    distance_min = 100     # 10 cm min
+    ser = None
+    distance = 0
+    strength = 0
+    celsius = 0
+
+    def init(self):
+        self.ser = serial.Serial("/dev/ttyAMA0", 115200)     # Lidar module has 115200 baud
+        self.ser.flushInput()
+        if not self.ser.isOpen():
+            return False
+        return True
+
+    def last_distance(self):
+        return self.distance
+    def calc_distance(self):
+        if  self.ser.inWaiting() < self.lidar_bytes:
+            rlog.debug("Error, no data received from Lidar sensor")
+            return
+        result = self.ser.read(self.ser.inWaiting())
+        rlog.log(value_debug_level, f"Lidar sensor - Bytes received: {len(result)} : {binascii.hexlify(result)} ")
+        if len(result) >= self.lidar_bytes:
+            index = len(result) - self.lidar_bytes
+            while True:   # find last 0x59 0x59
+                 if result[index] == 0x59 and result[index + 1] == 0x59:
+                     break
+                 else:
+                     if index > 0:
+                         index = index - 1
+                     else:
+                         rlog.debug("Lidar-Sensor: Frame Header not found")
+                         return
+            # here we found two 0x59, now check checksum
+            checksum = 0x00
+            for i in range(self.lidar_bytes - 1):
+                checksum += result[index + i]
+            if (checksum & 0xFF) == result[index + 8]:  # checksum check
+                # now calculate distance and strength
+                self.distance = 10 * (result[index + 2] + result[index + 3] * 256)
+                if self.distance > self.distance_max or self.distance < self.distance_min:
+                    self.distance = 0
+                self.strength = result[index + 4] + result[index + 3] * 256
+                self.celsius = result[index + 6] + result[index + 7] * 256
+                #  Convert temp code to degrees Celsius.
+                self.celsius =  self.celsius / 8 - 256
+                rlog.log(value_debug_level, "Lidar-Sensor: Distance {self.distance} Strength {self.strength} Celsius {self.celsius}")
+            else:
+                 rlog.debug(f"Lidar-Sensor: Invalid checksum")
+        else:
+              rlog.debug(f"Lidar-Sensor: Error less bytes read than expected")
+
+
+
 def reset_values():
     global runup_situation
     global start_situation
@@ -169,7 +285,6 @@ def reset_values():
     global stop_situation
     global zero_distance
     global fly_status
-    global ground_distance_active
 
     runup_situation = None
     start_situation = None
@@ -188,7 +303,7 @@ def reset_values():
             rlog.debug('Error resetting gound zero distance')
 
 
-def init(activate, debug_level, distance_indication, situation, sim_mode):
+def init(activate, stat_file, debug_level, distance_indication, situation, sim_mode, g_config):
     global rlog
     global ground_distance_active
     global indicate_distance
@@ -197,20 +312,22 @@ def init(activate, debug_level, distance_indication, situation, sim_mode):
     global global_situation
     global zero_distance
     global simulation_mode
+    global saved_statistics
+    global global_config
 
     simulation_mode = sim_mode
+    global_config = g_config
     rlog = logging.getLogger('stratux-radar-log')
     if not activate:
         rlog.debug("Ground Distance Measurement - not activated.")
         ground_distance_active = False
         return False
     try:
-        distance_sensor = UsonicSensor()
+        distance_sensor = LidarSensor()
         if not distance_sensor.init():
             rlog.debug("Ground Distance Measurement - Error init ultrasonic sensor, serial not found")
             ground_distance_active = False
             return False
-        distance_sensor.set_dis_range(35, 2000)  # range between 35 mm and 2 meter
     except Exception as e:
         ground_distance_active = False
         rlog.debug("Ground Distance Measurement - Ultrasonic sensor not found: " + str(e))
@@ -218,12 +335,14 @@ def init(activate, debug_level, distance_indication, situation, sim_mode):
 
     ground_distance_active = True
     value_debug_level = debug_level
+    saved_statistics = stat_file
     global_situation = situation  # to be able to read and store situation info
-    rlog.debug("Ground Distance Measurement - Ultrasonic sensor active.")
+    rlog.debug("Ground Distance Measurement - Ground sensor active.")
 
     if distance_indication:
         indicate_distance = True
         rlog.debug("Ground Distance Measurement: indication distance activated")
+        prepare_sounds()
     return ground_distance_active
 
 
@@ -233,19 +352,67 @@ def write_stats():
     if rlog is None:  # may be called before init
         rlog = logging.getLogger('stratux-radar-log')
     try:
-        with open(SAVED_STATISTICS, 'at') as out:
+        with open(saved_statistics, 'at') as out:
             json.dump(calculate_output_values(), out, indent=4, default=str)
     except (OSError, IOError, ValueError) as e:
-        rlog.debug("Grounddistance: Error " + str(e) + " writing " + SAVED_STATISTICS)
-    rlog.debug("Grounddistance: Statistics saved to " + SAVED_STATISTICS)
+        rlog.debug("Grounddistance: Error " + str(e) + " writing " + saved_statistics)
+    rlog.debug("Grounddistance: Statistics saved to " + saved_statistics)
 
 
-def distance_beeper(distance):
-    if indicate_distance:
-        if DISTANCE_BEEP_MIN <= distance <= DISTANCE_BEEP_MAX:
-            # to do tone_pitch = radarbluez.beep()
-            # generate tone on raspberry
-            pass
+def prepare_sounds():
+    global gps_warnings_sounds
+    global sensor_warnings_sounds
+    global gear_not_down_warning_sound
+    global go_around_warning_sound
+
+    gps_warnings_sounds = radarbluez.prepare_sounds_tuple(gps_warnings)
+    sensor_warnings_sounds = radarbluez.prepare_sounds_tuple(sensor_warnings)
+    gear_not_down_warning_sound = radarbluez.prepare_sounds_string(GEAR_DOWN_WARNING)
+    go_around_warning_sound = radarbluez.prepare_sounds_string(GEAR_NOT_DOWN_GO_AROUND)
+
+
+def calc_distance_speaker(stat):
+    if stat['gps_active'] and stat['gps_v_accuracy'] < MIN_GPS_V_ACCURACY:
+        gps_distance = stat['gps_altitude'] - dest_elevation   # both are in ft
+    else:
+        gps_distance = 0.0
+    if stat['g_distance_valid']:
+        ground_distance = stat['g_distance'] / 328.1    # g_distance is in mm, here we need ft
+    else:
+        ground_distance = 0.0
+    if indicate_distance and fly_status == 1:
+        for (i, height) in enumerate(gps_warnings):
+            if gps_distance <= height and gps_upper[i]:
+                # distance is reached and was before higher than hysteresis
+                if gps_warnings_sounds is not None:
+                    radarbluez.speak_sound(gps_warnings_sounds[i])
+                gps_upper[i] = False
+            if gps_distance >= height * hysteresis:
+                gps_upper[i] = True
+        for (i, height) in enumerate(sensor_warnings):
+            if ground_distance <= height and sensor_upper[i]:
+                # distance is reached and was before higher than hysteresis
+                if sensor_warnings_sounds is not None:
+                    radarbluez.speak_sound(sensor_warnings_sounds[i])
+                sensor_upper[i] = False
+            if ground_distance >= height * hysteresis:
+                sensor_upper[i] = True
+    if global_config['gear_indication_active'] and fly_status == 1:
+        for (i, height) in enumerate(gear_gps_warnings):
+            if gps_distance <= height and gear_gps_upper[i]:
+                if stat['gear_down'] is False and gear_not_down_warning_sound is not None:
+                    radarbluez.speak_sound(gear_not_down_warning_sound, GEAR_DOWN_WARNING)
+                gear_gps_upper[i] = False
+            if gps_distance >= height * hysteresis:
+                gear_gps_upper[i] = True
+        for (i, height) in enumerate(gear_sensor_warnings):
+            if ground_distance <= height and gear_sensor_upper[i]:
+                # distance is reached and was before higher than hysteresis
+                if stat['gear_down'] is False and go_around_warning_sound is not None:
+                    radarbluez.speak_sound(go_around_warning_sound, GEAR_NOT_DOWN_GO_AROUND)
+                gear_sensor_upper[i] = False
+            if ground_distance >= height * hysteresis:
+                gear_sensor_upper[i] = True
 
 
 def is_airborne():
@@ -405,11 +572,10 @@ def evaluate_statistics(latest_stat):
             obstacle_down_clear = None  # clear obstacle down, only last landing is recorded
             rlog.debug("Grounddistance: Re-Start detected without stop, keeping first start " +
                        json.dumps(start_situation, indent=4, sort_keys=True, default=str))
-
+    calc_distance_speaker(latest_stat)
 
 def store_statistics(sit):
     global stats_next_store
-    global statistics
 
     if simulation_mode:
         sim_data = simulation.read_simulation_data()
@@ -423,16 +589,26 @@ def store_statistics(sit):
             if 'gps_speed' in sim_data:
                 sit['gps_speed'] = sim_data['gps_speed']
                 sit['gps_active'] = True
+            if 'gps_altitude' in sim_data:
+                sit['gps_altitude'] = sim_data['gps_altitude']
+                sit['gps_active'] = True
+                sit['gps_hor_accuracy'] = 50  # just any nice valud
             if 'own_altitude' in sim_data:
                 sit['own_altitude'] = sim_data['own_altitude']
                 sit['baro_valid'] = True
+            if 'gear_down' in sim_data:
+                sit['gear_down'] = sim_data['gear_down']
+            else:
+                sit['gear_down'] = False
     if time.perf_counter() > stats_next_store:
         stats_next_store = time.perf_counter() + (1 / STATS_PER_SECOND)
         now = datetime.datetime.now(datetime.timezone.utc)
         stat_value = {'Time': now, 'baro_valid': sit['baro_valid'], 'own_altitude': sit['own_altitude'],
                       'gps_active': sit['gps_active'], 'longitude': sit['longitude'], 'latitude': sit['latitude'],
-                      'gps_speed': sit['gps_speed'], 'g_distance_valid': sit['g_distance_valid'],
-                      'g_distance': sit['g_distance']}
+                      'gps_speed': sit['gps_speed'], 'gps_altitude': sit['gps_altitude'],
+                      'gps_h_accuracy': sit['gps_h_accuracy'], 'gps_v_accuracy': sit['gps_v_accuracy'],
+                      'g_distance_valid': sit['g_distance_valid'], 'g_distance': sit['g_distance'],
+                      'gear_down': sit['gear_down']}
         statistics.append(stat_value)
         if len(statistics) > stats_max_values:     # sliding window, remove old values
             statistics.pop(0)
@@ -440,13 +616,11 @@ def store_statistics(sit):
 
 
 async def read_ground_sensor():
-    global distance_sensor
-    global global_situation
     global zero_distance
 
     if ground_distance_active:
         rlog.debug("Ground distance reader active ...")
-        await distance_sensor.calc_distance()
+        distance_sensor.calc_distance()
         new_zero_distance = distance_sensor.last_distance()  # distance in mm this is zero
         if new_zero_distance > 0:
             zero_distance = new_zero_distance  # distance in mm this is zero
@@ -458,8 +632,8 @@ async def read_ground_sensor():
             while True:
                 now = time.perf_counter()
                 await asyncio.sleep(next_read - now)  # wait for next time of measurement
-                next_read = now + (1 / MEASUREMENTS_PER_SECOND)
-                await distance_sensor.calc_distance()   # asynchronous, may wait
+                next_read = next_read + (1 / MEASUREMENTS_PER_SECOND)
+                distance_sensor.calc_distance()
                 distance = distance_sensor.last_distance()  # distance in mm
                 if distance > 0:
                     global_situation['g_distance_valid'] = True
@@ -470,8 +644,14 @@ async def read_ground_sensor():
                     global_situation['g_distance_valid'] = False
                     global_situation['g_distance'] = INVALID_GDISTANCE   # just to be safe
                     rlog.log(value_debug_level, 'Ground Distance: Sensor value invalid, maybe out of range')
+                if global_config['gear_indication_active']:
+                    global_situation['gear_down'] = radarbuttons.gear_is_down()
+                    rlog.log(value_debug_level, 'Ground Distance: gear-down: {0}'.format(global_situation['gear_down']))
+                else:
+                    global_situation['gear_down'] = False   # default value if not to be indicated
                 store_statistics(global_situation)
         except (asyncio.CancelledError, RuntimeError):
             rlog.debug("Ground distance reader terminating ...")
     else:
         rlog.debug("No ground distance sensor active.")
+
